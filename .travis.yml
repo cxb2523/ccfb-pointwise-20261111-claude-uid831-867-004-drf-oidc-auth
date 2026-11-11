@@ -1,0 +1,11 @@
+language: python
+dist: focal
+python:
+  - 3.7
+  - 3.8
+  - 3.9
+  - 3.10
+install:
+  - pip install -U tox tox-travis pip virtualenv
+script:
+  - tox

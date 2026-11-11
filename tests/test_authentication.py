@@ -5,9 +5,11 @@ import time
 
 from joserfc import jwt as joserfc_jwt
 from joserfc.errors import BadSignatureError, DecodeError
+from joserfc.jwk import RSAKey
 from django.http import HttpResponse
 from django.test import TestCase
 from django.urls import re_path as url
+from requests.models import Response
 from oidc_auth.authentication import (BearerTokenAuthentication,
                                       JSONWebTokenAuthentication)
 from oidc_auth.test import AuthenticationTestCaseMixin, key, make_id_token
@@ -143,6 +145,34 @@ class TestBearerAuthentication(AuthenticationTestCaseMixin, TestCase):
 
 class TestJWTAuthentication(AuthenticationTestCaseMixin, TestCase):
     urls = __name__
+
+    def setUp(self):
+        super(TestJWTAuthentication, self).setUp()
+        # Serve the JWKS from a mutable key list so tests can simulate key
+        # rotation; the mock also counts fetches for cache assertions.
+        self.jwks_keys = [key.as_dict()]
+        self.jwks_request = self.patch('oidc_auth.authentication.request')
+        self.jwks_request.side_effect = self.fake_jwks_request
+
+    def fake_jwks_request(self, *args, **kwargs):
+        response = Response()
+        response._content = json.dumps({'keys': self.jwks_keys}).encode('utf-8')
+        response.status_code = 200
+        return response
+
+    def make_signed_token(self, signing_key, **claims):
+        payload = dict(
+            iss='http://example.com',
+            aud='you',
+            exp=int(time.time()) + 3600,
+            iat=int(time.time()),
+            sub=str(self.user.username),
+        )
+        payload.update(claims)
+        token = joserfc_jwt.encode(
+            {'alg': 'RS256', 'kid': signing_key.as_dict()['kid']},
+            payload, signing_key)
+        return token.decode('ascii') if isinstance(token, bytes) else token
 
     def make_token(self, header, payload=None, key=None):
         payload = payload or dict(
@@ -309,4 +339,117 @@ class TestJWTAuthentication(AuthenticationTestCaseMixin, TestCase):
 
         self.assertEqual(resp.status_code, 401)
         logger_mock.exception.assert_called_once_with(
-            'Invalid Authorization header. JWT Signature verification failed.')
+            'JWT authentication failed [trace_id=%s]: %s', '-', 'undecodable JWT')
+
+    @patch('oidc_auth.authentication.logger')
+    def test_failure_log_contains_trace_id(self, logger_mock):
+        auth = 'JWT ' + make_id_token(self.user.username, exp=13151351)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth,
+                               HTTP_X_REQUEST_ID='trace-abc-123')
+        self.assertEqual(resp.status_code, 401)
+        logger_mock.exception.assert_called_once_with(
+            'JWT authentication failed [trace_id=%s]: %s',
+            'trace-abc-123', 'JWT has expired')
+
+    def test_expired_jwt_returns_401_with_rfc6750_header(self):
+        auth = 'JWT ' + make_id_token(self.user.username, exp=13151351)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth)
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('Bearer realm="api"', resp['WWW-Authenticate'])
+        self.assertIn('error="invalid_token"', resp['WWW-Authenticate'])
+        self.assertIn('error_description=', resp['WWW-Authenticate'])
+
+    def test_malformed_header_returns_invalid_request_error(self):
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION='JWT')
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('error="invalid_request"', resp['WWW-Authenticate'])
+
+    def test_error_response_does_not_leak_claims(self):
+        auth = 'JWT ' + make_id_token(self.user.username, aud='somebody')
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth)
+        self.assertEqual(resp.status_code, 401)
+        # Neither the claim value nor joserfc internals may leak into the body
+        self.assertNotIn('somebody', resp.content.decode())
+        self.assertNotIn('invalid_claim', resp.content.decode())
+        self.assertNotIn('aud', resp.content.decode())
+
+    def test_error_response_does_not_leak_key_material(self):
+        other_key = RSAKey.generate_key(auto_kid=True)
+        token = self.make_signed_token(other_key)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION='JWT ' + token)
+        self.assertEqual(resp.status_code, 401)
+        kid = other_key.as_dict()['kid']
+        self.assertNotIn(kid, resp.content.decode())
+        self.assertNotIn(key.as_dict()['n'], resp.content.decode())
+
+    def test_with_token_signed_by_unknown_key(self):
+        other_key = RSAKey.generate_key(auto_kid=True)
+        auth = 'JWT ' + self.make_signed_token(other_key)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth)
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('error="invalid_token"', resp['WWW-Authenticate'])
+
+    def test_with_invalid_signature_same_kid(self):
+        # Token signed with an independent private key but referencing the
+        # real key id: exercises the BadSignatureError path.
+        other_key = RSAKey.generate_key(auto_kid=True)
+        forged_key_dict = other_key.as_dict(private=True)
+        forged_key_dict['kid'] = key.as_dict()['kid']
+        forged_key = RSAKey.import_key(forged_key_dict)
+        auth = 'JWT ' + self.make_signed_token(forged_key)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_invalid_signature_does_not_bust_jwks_cache(self):
+        # A flood of tokens with unknown keys must not hammer the IdP:
+        # the forced JWKS refresh is rate-limited by a lock.
+        other_key = RSAKey.generate_key(auto_kid=True)
+        auth = 'JWT ' + self.make_signed_token(other_key)
+        for _ in range(3):
+            resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth)
+            self.assertEqual(resp.status_code, 401)
+        # 1 initial fetch + 1 rate-limited refresh, no matter how many
+        # invalid tokens are thrown at the endpoint.
+        self.assertEqual(self.jwks_request.call_count, 2)
+
+    def test_key_rotation(self):
+        # Valid token signed with the current key populates the JWKS cache
+        old_token = make_id_token(self.user.username)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION='JWT ' + old_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.jwks_request.call_count, 1)
+
+        # IdP rotates its signing key and publishes old + new keys
+        new_key = RSAKey.generate_key(auto_kid=True)
+        self.jwks_keys.append(new_key.as_dict())
+
+        # A token signed with the new key must not be rejected just because
+        # the cache still holds only the old key: it triggers a refresh.
+        new_token = self.make_signed_token(new_key)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION='JWT ' + new_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.jwks_request.call_count, 2)
+
+        # After the refresh, tokens signed with the old key still pass
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION='JWT ' + old_token)
+        self.assertEqual(resp.status_code, 200)
+
+        # Tokens signed with an unrelated key are still rejected with 401
+        # (and do not trigger another fetch thanks to the refresh lock)
+        other_key = RSAKey.generate_key(auto_kid=True)
+        auth = 'JWT ' + self.make_signed_token(other_key)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self.jwks_request.call_count, 2)
+
+    def test_with_non_ascii_jwt(self):
+        # Undecodable bytes must yield a 401, not bubble up as a 500
+        authentication = JSONWebTokenAuthentication()
+        with self.assertRaises(AuthenticationFailed):
+            authentication.decode_jwt('üñïçø∂é'.encode('utf-8'))
+
+    def test_valid_jwt_still_returns_200(self):
+        auth = 'JWT ' + make_id_token(self.user.username)
+        resp = self.client.get('/test/', HTTP_AUTHORIZATION=auth)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content.decode(), 'a')

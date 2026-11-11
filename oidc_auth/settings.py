@@ -26,6 +26,12 @@ DEFAULTS = {
     # Time before JWKS will be refreshed
     'OIDC_JWKS_EXPIRATION_TIME': 24 * 60 * 60,
 
+    # Minimum seconds between forced JWKS refreshes. Refreshes are triggered
+    # by tokens referencing unknown key ids or failing signature checks
+    # (key rotation); the cooldown keeps a flood of invalid tokens from
+    # hammering the IdP (cache penetration).
+    'OIDC_JWKS_REFRESH_LOCK_TIMEOUT': 30,
+
     # Function to resolve user from request and token or userinfo
     'OIDC_RESOLVE_USER_FUNCTION': 'oidc_auth.authentication.get_user_by_id',
 

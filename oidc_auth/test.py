@@ -1,6 +1,7 @@
 import json
 import time
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from requests.models import Response
 from joserfc import jwt
 from joserfc.jwk import RSAKey
@@ -79,6 +80,9 @@ class AuthenticationTestCaseMixin(object):
         return patched
 
     def setUp(self):
+        # The JWKS cache and the JWKS refresh lock live in the shared Django
+        # cache; clear it so tests cannot leak state into each other.
+        cache.clear()
         self.user, _ = get_user_model().objects.get_or_create(username=self.username)
         self.responder = FakeRequests()
         self.responder.set_response("http://example.com/.well-known/openid-configuration",

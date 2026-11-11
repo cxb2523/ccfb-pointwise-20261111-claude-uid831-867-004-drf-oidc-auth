@@ -19,14 +19,22 @@ class cache(object):
         self.cache_version = cache_version
 
     def __call__(self, fn):
+        def make_key(*args):
+            return api_settings.OIDC_CACHE_PREFIX + '.'.join([fn.__name__] + list(map(str, args)))
+
         @functools.wraps(fn)
         def wrapped(this, *args):
             cache = caches[api_settings.OIDC_CACHE_NAME]
-            key = api_settings.OIDC_CACHE_PREFIX + '.'.join([fn.__name__] + list(map(str, args)))
+            key = make_key(*args)
             cached_value = cache.get(key, version=self.cache_version)
             if not cached_value:
                 cached_value = fn(this, *args)
                 cache.set(key, cached_value, timeout=self.ttl, version=self.cache_version)
             return cached_value
 
+        # Exposed so callers can invalidate or refresh the cached value
+        # (e.g. JWKS key rotation) using the exact same cache key.
+        wrapped.make_key = make_key
+        wrapped.cache_version = self.cache_version
+        wrapped.ttl = self.ttl
         return wrapped

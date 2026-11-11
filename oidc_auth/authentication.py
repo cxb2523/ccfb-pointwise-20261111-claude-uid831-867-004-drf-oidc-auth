@@ -3,12 +3,13 @@ import time
 
 import requests
 from joserfc import jwt
-from joserfc.errors import (BadSignatureError, DecodeError,
+from joserfc.errors import (BadSignatureError, ClaimError, DecodeError,
                             ExpiredTokenError, InvalidKeyIdError,
                             JoseError, UnsupportedAlgorithmError)
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 from django.contrib.auth import get_user_model
+from django.core.cache import caches
 from django.utils.encoding import smart_str
 from django.utils.functional import cached_property
 from django.utils.translation import gettext as _
@@ -96,6 +97,11 @@ class JSONWebTokenAuthentication(BaseOidcAuthentication):
     """Token based authentication using the JSON Web Token standard"""
 
     www_authenticate_realm = 'api'
+    www_authenticate_scheme = 'Bearer'
+
+    # Correlates failure logs with the request; set per-request in
+    # authenticate(), falls back to '-' when decode_jwt is called directly.
+    trace_id = '-'
 
     @property
     def claims_options(self):
@@ -110,12 +116,25 @@ class JSONWebTokenAuthentication(BaseOidcAuthentication):
         return _claims_options
 
     def authenticate(self, request):
-        jwt_value = self.get_jwt_value(request)
-        if jwt_value is None:
-            return None
-        payload = self.decode_jwt(jwt_value)
-        self.validate_claims(payload)
+        self.trace_id = request.META.get('HTTP_X_REQUEST_ID', '-')
+        try:
+            jwt_value = self.get_jwt_value(request)
+            if jwt_value is None:
+                return None
+            payload = self.decode_jwt(jwt_value)
+            self.validate_claims(payload)
+        except AuthenticationFailed as exc:
+            # Carry the RFC 6750 error info on the request so that
+            # authenticate_header() (called by DRF on a fresh instance of
+            # this class) can render it into the WWW-Authenticate header.
+            request.oidc_auth_error = getattr(exc, 'oidc_error', 'invalid_token')
+            request.oidc_auth_error_description = getattr(
+                exc, 'oidc_error_description', None)
+            raise
 
+        # User resolution is deliberately outside the JWT error handling
+        # above: permission and user-lookup errors must not be masked as
+        # authentication failures.
         user = api_settings.OIDC_RESOLVE_USER_FUNCTION(request, payload)
 
         return user, payload
@@ -128,12 +147,13 @@ class JSONWebTokenAuthentication(BaseOidcAuthentication):
             return None
 
         if len(auth) == 1:
-            msg = _('Invalid Authorization header. No credentials provided')
-            raise AuthenticationFailed(msg)
+            raise self._authentication_failed(
+                _('Invalid Authorization header. No credentials provided'),
+                'no credentials in Authorization header', error='invalid_request')
         elif len(auth) > 2:
-            msg = _(
-                'Invalid Authorization header. Credentials string should not contain spaces.')
-            raise AuthenticationFailed(msg)
+            raise self._authentication_failed(
+                _('Invalid Authorization header. Credentials string should not contain spaces.'),
+                'credentials string contains spaces', error='invalid_request')
 
         return auth[1]
 
@@ -142,9 +162,38 @@ class JSONWebTokenAuthentication(BaseOidcAuthentication):
 
     @cache(ttl=api_settings.OIDC_JWKS_EXPIRATION_TIME)
     def jwks_data(self):
+        return self.fetch_jwks_data()
+
+    def fetch_jwks_data(self):
         r = request("GET", self.oidc_config['jwks_uri'], allow_redirects=True)
         r.raise_for_status()
         return r.json()
+
+    def refresh_jwks_data(self):
+        """Fetch a fresh JWKS from the IdP and update the cached key set.
+
+        Triggered when a token references an unknown key id or fails
+        signature verification, which usually means the IdP rotated its
+        signing keys. A short-lived lock rate-limits these fetches so a
+        flood of invalid tokens cannot hammer the IdP (cache penetration).
+        """
+        django_cache = caches[api_settings.OIDC_CACHE_NAME]
+        lock_key = api_settings.OIDC_CACHE_PREFIX + 'jwks_refresh_lock'
+        if not django_cache.add(
+                lock_key, True, timeout=api_settings.OIDC_JWKS_REFRESH_LOCK_TIMEOUT):
+            # A refresh happened very recently; use whatever is cached now.
+            return self.jwks_data()
+        try:
+            jwks_data = self.fetch_jwks_data()
+        except Exception:
+            logger.warning('Unable to refresh JWKS [trace_id=%s]',
+                           self.trace_id, exc_info=True)
+            return self.jwks_data()
+        django_cache.set(
+            self.jwks_data.make_key(), jwks_data,
+            timeout=api_settings.OIDC_JWKS_EXPIRATION_TIME,
+            version=self.jwks_data.cache_version)
+        return jwks_data
 
     @cached_property
     def issuer(self):
@@ -152,31 +201,60 @@ class JSONWebTokenAuthentication(BaseOidcAuthentication):
 
     def decode_jwt(self, jwt_value):
         try:
+            key_set = self.jwks()
+        except ValueError as e:
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT signature key not found.'),
+                'cached JWKS could not be imported', e)
+
+        try:
+            return self._decode_token(jwt_value, key_set)
+        except (InvalidKeyIdError, BadSignatureError):
+            # Unknown key id or signature mismatch: the IdP may have rotated
+            # its signing keys since the JWKS was cached. Refresh the key set
+            # (rate-limited) and retry once before rejecting the token.
+            try:
+                key_set = KeySet.import_key_set(self.refresh_jwks_data())
+            except ValueError as e:
+                raise self._authentication_failed(
+                    _('Invalid Authorization header. JWT signature key not found.'),
+                    'refreshed JWKS could not be imported', e)
+            try:
+                return self._decode_token(jwt_value, key_set)
+            except (InvalidKeyIdError, BadSignatureError) as e:
+                raise self._authentication_failed(
+                    _('Invalid Authorization header. JWT Signature verification failed.'),
+                    'signature verification failed', e)
+
+    def _decode_token(self, jwt_value, key_set):
+        """Decode and verify a JWT against the given key set.
+
+        Only JWT parsing and signature verification errors are converted to
+        401s here; InvalidKeyIdError and BadSignatureError are re-raised so
+        decode_jwt() can retry once with a refreshed key set.
+        """
+        try:
             token = jwt.decode(
                 jwt_value.decode('ascii'),
-                lambda header: self.jwks(),
+                lambda header: key_set,
                 algorithms=api_settings.JWT_ALGORITHMS
             )
-        except UnsupportedAlgorithmError:
-            msg = _(
-                'Invalid Authorization header. JWT algorithm not allowed.')
-            logger.exception(msg)
-            raise AuthenticationFailed(msg)
-        except (BadSignatureError, DecodeError):
-            msg = _(
-                'Invalid Authorization header. JWT Signature verification failed.')
-            logger.exception(msg)
-            raise AuthenticationFailed(msg)
-        except (InvalidKeyIdError, ValueError):
-            msg = _(
-                'Invalid Authorization header. JWT signature key not found.')
-            logger.exception(msg)
-            raise AuthenticationFailed(msg)
-        except JoseError:
-            msg = _(
-                'Invalid Authorization header. JWT could not be decoded.')
-            logger.exception(msg)
-            raise AuthenticationFailed(msg)
+        except (InvalidKeyIdError, BadSignatureError):
+            raise
+        except UnsupportedAlgorithmError as e:
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT algorithm not allowed.'),
+                'JWT algorithm not allowed', e)
+        except (DecodeError, ValueError) as e:
+            # DecodeError: malformed JWT. ValueError (incl.
+            # UnicodeDecodeError): non-ASCII or otherwise undecodable input.
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT could not be decoded.'),
+                'undecodable JWT', e)
+        except JoseError as e:
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT could not be verified.'),
+                'JWT verification failed', e)
 
         return token.claims
 
@@ -188,16 +266,52 @@ class JSONWebTokenAuthentication(BaseOidcAuthentication):
         )
         try:
             registry.validate(id_token)
-        except ExpiredTokenError:
-            msg = _('Invalid Authorization header. JWT has expired.')
-            raise AuthenticationFailed(msg)
+        except ExpiredTokenError as e:
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT has expired.'),
+                'JWT has expired', e)
+        except ClaimError as e:
+            # The specific claim error goes to the log only; claim names and
+            # values are internal details that must not leak into responses.
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT claims validation failed.'),
+                'JWT claims validation failed: {0}'.format(e), e)
         except JoseError as e:
-            msg = _(str(type(e)) + str(e))
-            raise AuthenticationFailed(msg)
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT could not be validated.'),
+                'JWT validation failed: {0}'.format(e), e)
 
         if id_token.get('iat', 0) < int(time.time()) - api_settings.OIDC_LEEWAY:
-            msg = _('Invalid Authorization header. JWT too old.')
-            raise AuthenticationFailed(msg)
+            raise self._authentication_failed(
+                _('Invalid Authorization header. JWT too old.'),
+                'JWT issued too long ago')
+
+    def _authentication_failed(self, message, reason, exc=None, error='invalid_token'):
+        """Log the real failure reason and build a 401 with a safe message.
+
+        The log line carries the specific reason and the request's trace id;
+        the public message stays generic so no claims, key material or other
+        internals end up in the response body.
+        """
+        if exc is None:
+            logger.warning('JWT authentication failed [trace_id=%s]: %s',
+                           self.trace_id, reason)
+        else:
+            logger.exception('JWT authentication failed [trace_id=%s]: %s',
+                             self.trace_id, reason)
+        failure = AuthenticationFailed(message)
+        failure.oidc_error = error
+        failure.oidc_error_description = message
+        return failure
 
     def authenticate_header(self, request):
-        return 'JWT realm="{0}"'.format(self.www_authenticate_realm)
+        """Render an RFC 6750 compliant WWW-Authenticate header."""
+        header = '{0} realm="{1}"'.format(
+            self.www_authenticate_scheme, self.www_authenticate_realm)
+        error = getattr(request, 'oidc_auth_error', None)
+        if error:
+            header += ', error="{0}"'.format(error)
+            description = getattr(request, 'oidc_auth_error_description', None)
+            if description:
+                header += ', error_description="{0}"'.format(description)
+        return header
